@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """
-Reference Pattern: Pre-Collect Cron + CLI Offload (0 LLM Tokens for Data Gathering)
+Pre-collect pattern: gather data with a plain script, let the LLM only write.
 
-Instead of waking an LLM agent to run 10+ web_search/mcp tool calls in a loop
-(burning 50k-200k tokens per tick), run a deterministic Python pre-collector first.
+An agent that searches, scrapes and deduplicates on its own spends one model
+call per tool step, and every step re-sends the growing context. A script does
+the collection for 0 LLM tokens and prints a compact JSON; the agent gets that
+as context and does a single reasoning pass.
 
-In Hermes Agent cron:
-    hermes cron create --schedule "every 6h" --script pre_collect_cron_example.py \
-        --prompt "Write a concise digest from the pre-collected JSON items above."
+Hermes Agent (script must live in ~/.hermes/scripts/):
+    hermes cron create "every 6h" "Write a short digest of the new repos above." \
+        --script pre_collect_cron_example.py
 
-If combined with `monitor:` or `no_agent: true`, unchanged ticks cost 0 LLM tokens.
+Claude Code / Codex / any CLI agent:
+    python pre_collect_cron_example.py | claude -p "Write a short digest of these repos."
+    python pre_collect_cron_example.py | codex exec "Write a short digest of these repos."
+
+With nothing new the script prints nothing, so a `--no-agent` Hermes cron or a
+shell `[ -n "$out" ]` guard skips the model call entirely.
 """
 import hashlib
 import json
@@ -18,56 +25,52 @@ import sys
 import urllib.request
 from pathlib import Path
 
-STATE_FILE = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))) / "pre_collect_state.json"
+STATE = Path(os.environ.get("PRE_COLLECT_STATE",
+                            Path.home() / ".cache" / "pre_collect_state.json"))
+KEEP = 2000  # remembered ids, oldest dropped first
+URL = ("https://api.github.com/search/repositories"
+       "?q=topic:mcp+stars:>100&sort=updated&per_page=10")
 
 
-def load_seen() -> set[str]:
-    if STATE_FILE.exists():
-        try:
-            return set(json.loads(STATE_FILE.read_text(encoding="utf-8")).get("seen", []))
-        except Exception:
-            return set()
-    return set()
+def load_seen() -> list:
+    try:
+        return json.loads(STATE.read_text(encoding="utf-8")).get("seen", [])
+    except (OSError, ValueError):
+        return []
 
 
-def save_seen(seen: set[str]) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps({"seen": sorted(list(seen))[-500:]}, indent=2), encoding="utf-8")
-
-
-def fetch_json(url: str) -> dict:
-    req = urllib.request.Request(url, headers={"User-Agent": "hermes-pre-collector/1.0"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def save_seen(seen: list) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps({"seen": seen[-KEEP:]}), encoding="utf-8")
 
 
 def main() -> int:
-    seen = load_seen()
-    # Example: fetch top trending repositories via GitHub Search API (0 LLM tokens)
-    url = "https://api.github.com/search/repositories?q=topic:mcp+stars:>100&sort=updated&per_page=5"
+    seen = load_seen()  # insertion order = age order
+    known = set(seen)
+    req = urllib.request.Request(URL, headers={"User-Agent": "pre-collector/1.0"})
     try:
-        data = fetch_json(url)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
     except Exception as exc:
-        print(json.dumps({"status": "error", "error": str(exc)}))
-        return 0
+        print(f"collector error: {exc}", file=sys.stderr)
+        return 1
 
-    fresh_items = []
+    fresh = []
     for item in data.get("items", []):
         uid = hashlib.sha1(item["full_name"].encode()).hexdigest()[:12]
-        if uid in seen:
+        if uid in known:
             continue
-        seen.add(uid)
-        # Strip 95% of noisy API fields before the LLM ever sees them
-        fresh_items.append({
+        known.add(uid)
+        seen.append(uid)
+        fresh.append({  # keep only what the model needs
             "repo": item["full_name"],
             "stars": item["stargazers_count"],
             "description": (item.get("description") or "")[:180],
             "url": item["html_url"],
         })
-
     save_seen(seen)
-    # Only compact, high-signal JSON enters the agent's context window
-    print(json.dumps({"new_count": len(fresh_items), "items": fresh_items}, ensure_ascii=False, indent=2))
+    if fresh:
+        print(json.dumps(fresh, ensure_ascii=False, indent=1))
     return 0
 
 

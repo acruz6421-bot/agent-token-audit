@@ -1,75 +1,129 @@
-# Hermes Token Diet & MCP Offload Toolkit
+# agent-token-audit
 
-Empirical token auditing, SQLite WAL maintenance, and zero-bloat MCP offload patterns for [Hermes Agent](https://github.com/NousResearch/hermes-agent) and autonomous LLM agents.
+Find out where your coding agents actually spend tokens, from the logs they already write to disk.
 
-> **Why this exists:** While the industry debates "MCP vs. Code Mode", we audited a production Hermes Agent database (`state.db`) with **139,951 messages**, **1,660 sessions**, and **4.63 billion input tokens**. This repository packages the diagnostic scripts and architectural patterns that cut our per-turn token overhead and cron execution costs by up to **93%** — using zero LLM tokens to run the audit itself.
+One read-only Python script (stdlib only, 0 LLM tokens, runs in about a second) that audits:
 
----
-
-## Key Empirical Findings (Measured, Not Estimated)
-
-### 1. The 360:1 Input:Output Bleed Ratio (`tool results` > System Prompt)
-In production multi-turn sessions, the static system prompt (~11.5k–14.5k tokens) was **not** the primary cost driver.
-- **Measured cumulative input:** `4,630,000,000` tokens
-- **Measured cumulative output:** `12,800,000` tokens
-- **Ratio:** **`360:1`**
-
-**Root cause:** Unbounded `tool results` (raw PDF extractions, 100KB+ MCP search dumps, verbose terminal logs) stored in `messages.content` and re-sent on **every subsequent turn** of an active session.
-- **High-impact lever:** Lowering `tool_output.max_bytes` (e.g. `20000` → `8000`) and filtering/reducing large payloads inside `execute_code` or 1-pass Python scripts before returning to chat.
-- **Low-impact myth (Refuted):** Archiving unused skills saved only `~30 tokens/skill` in `<available_skills>`, because Hermes only injects `name` + `description` until `skill_view` is called.Similarly, inactive sessions in `state.db` consume **0 tokens** unless resumed.
-
-### 2. Always-On MCPs vs. On-Demand CLI Offload (`-2,000 to -5,000 tok/turn`)
-An always-on MCP server with 10–15 tools injects ~1,800–3,000 tokens of JSON schema into **every turn**, even when unused.
-- **Pattern:** Keep heavy/infrequent MCP servers (semantic memory, media generators, AST indexers) **disabled** in `config.yaml` and wrap them in lightweight CLI scripts invoked on demand, or rely on Hermes's native deferred `tool_search` / `execute_code`.
-
-### 3. The Pre-Collect Cron Pattern (`-93% tokens per run`)
-Instead of waking an LLM agent on a schedule to call `web_search`, scrape pages, filter duplicates, and format output across 10+ tool-call round-trips:
-1. **Stage 1 (0 LLM tokens):** A deterministic Python script (`script:` in Hermes cron) fetches APIs/feeds, deduplicates against local state, and emits a compact JSON summary to stdout.
-2. **Stage 2 (Single-pass LLM):** The agent wakes up with the pre-collected JSON already injected into context and performs only high-value reasoning/copywriting.
-
-### 4. The SQLite WAL Reader-Snapshot Trap (`1.15 GB WAL on a 658 MB DB`)
-- `ls -la state.db` lies about disk usage: always sum `state.db` + `state.db-wal` + `state.db-shm`.
-- By default, SQLite uses `PRAGMA journal_size_limit = -1` (unlimited), and a long-running gateway process holds a read snapshot that prevents `PRAGMA wal_checkpoint(TRUNCATE)` from recycling pages in-process (`busy=0`, yet `ckpt < log`).
-- Running `scripts/wal_checkpoint_external.py` during a brief gateway stop reclaimed **1.15 GB** (`1,812 MB` → `657 MB`) in seconds.
-
-### 5. Measuring Real Skill Usage (Avoiding the `<available_skills>` False Positive)
-Running `SELECT content FROM messages WHERE content LIKE '%skill_name%'` matches the `<available_skills>` catalog injected into system prompts, producing a **100% false-positive rate** where every installed skill appears "used".
-- `scripts/audit_prompt_fat.py` inspects the structured `messages.tool_calls` JSON column to count **true** `skill_view` invocations.
-
----
-
-## Included Tools
-
-| Script | Purpose | LLM Tokens Used |
-|---|---|---|
-| `scripts/audit_prompt_fat.py` | Audits real rendered system prompt from `state.db`, detects phantom config fat, measures true `skill_view` usage via `tool_calls`, and computes the input:output bleed ratio. | **0** (Read-only SQLite URI) |
-| `scripts/audit_db_storage.py` | Audits physical disk footprint (`db + wal + shm`), WAL pragmas, `freelist` VACUUM yield, FTS5 index weight, and float-epoch session age distribution. | **0** |
-| `scripts/wal_checkpoint_external.py` | Safely drains and truncates multi-GB `.db-wal` files outside the gateway process and verifies `quick_check`, `foreign_key_check`, and FTS parity. | **0** |
-| `patterns/pre_collect_cron_example.py` | Reference implementation of the **Pre-Collect Cron Pattern** + **CLI Offload Wrapper**. | **0** |
-
----
-
-## Quick Start
+| Agent | Reads | Token totals | Cache split | Tool-result sizes | MCP config |
+|---|---|---|---|---|---|
+| [Hermes Agent](https://github.com/NousResearch/hermes-agent) | `~/.hermes/state.db` | ✅ | ✅ | ✅ | ✅ |
+| Claude Code | `~/.claude/projects/**/*.jsonl` | ✅ | ✅ | ✅ | ✅ (names) |
+| OpenAI Codex | `~/.codex/sessions/**/rollout-*.jsonl` | ✅ | ✅ | ✅ (text + images) | ✅ |
+| Google Antigravity | `~/.gemini/antigravity/` | ❌ not logged | ❌ | ❌ | ✅ (with schema size) |
 
 ```bash
-# 1. Audit your rendered system prompt, skill usage, and token bleed ratio (read-only, ~5s)
-python scripts/audit_prompt_fat.py
-
-# 2. Audit physical SQLite + WAL storage and FTS5 index health
-python scripts/audit_db_storage.py
-
-# 3. Truncate a bloated state.db-wal (run from a shell outside the gateway)
-hermes gateway stop
-python scripts/wal_checkpoint_external.py
-hermes gateway start
+python agent_token_audit.py              # every agent found, last 30 days
+python agent_token_audit.py --days 7 --agent claude
+python agent_token_audit.py --json > report.json
 ```
 
-Custom Hermes home or profile directory:
-```bash
-HERMES_HOME=~/.hermes/profiles/my-profile python scripts/audit_prompt_fat.py
-```
+Path overrides: `HERMES_HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `ANTIGRAVITY_HOME`.
+Optional: `pyyaml` for the Hermes config checks; Python 3.11+ for the Codex `config.toml` checks.
 
 ---
+
+## What it reports
+
+For each agent:
+
+- **Input split three ways**: uncached, cache read, cache write. Most "my agent burned 5 billion tokens" numbers are mostly cache reads, which cost about a tenth of normal input on Anthropic and OpenAI. The cache-hit % is the first number to look at.
+- **Input:output ratio.** Agents re-send the whole conversation on every call, so 100:1 to 300:1 is normal for long sessions. When it climbs, the fix is shorter sessions or earlier compaction, not a smaller system prompt.
+- **Largest tool results**, with the tool that produced them. One 600k-char file read stays in context, and is re-sent, until the session ends or compacts.
+- **Image payloads in tool results** (screenshots), separately from text.
+- **Top sessions by input**, with days since last activity. An idle session costs nothing. Its lifetime total is history, not an ongoing bleed.
+- **MCP servers** enabled vs configured. For Antigravity, which caches tool schemas on disk, the approximate schema size of each server too.
+- **The relevant knobs and their current values**, plus concrete tips when a threshold is crossed.
+
+### Where each agent's knobs are
+
+| Lever | Hermes Agent | Claude Code | Codex |
+|---|---|---|---|
+| Cap tool output | `tool_output.max_bytes` (default 50000) | `BASH_MAX_OUTPUT_LENGTH` (30000), `MAX_MCP_OUTPUT_TOKENS` (25000) | `tool_output_token_limit` |
+| Compact earlier | `compression.threshold` | `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, `/compact` | `model_auto_compact_token_limit`, `/compact` |
+| Defer MCP schemas | `tools.tool_search` (auto) | `ENABLE_TOOL_SEARCH` (on by default) | `enabled_tools` / `disabled_tools` per server |
+| Turn an MCP server off | `mcp_servers.<name>.enabled: false` | remove from `~/.claude.json` | `mcp_servers.<id>.enabled = false` |
+
+Antigravity: `disabled: true` or `disabledTools` per server in `mcp_config.json`.
+
+---
+
+## Example: one heavy user, one machine
+
+Real output, October 2026. These numbers are not a benchmark.
+
+| | Hermes (30 d) | Claude Code (all history) | Codex (30 d) |
+|---|---|---|---|
+| API calls | 14,490 | 10,898 | 34 |
+| Total input | 2.15 B | 3.39 B | 2.45 M |
+| Cache read share | 69 % | 97 % | 93 % |
+| Input:output | 225:1 | 310:1 | 92:1 |
+| Largest tool result | 98 k chars (`web_extract`) | 613 k chars (`Read`) | 2.6 M chars (screenshot via `exec`) |
+
+What it showed:
+
+1. **Most of the scary totals were cache reads.** Claude Code's 3.39 B input works out to about 440 M at uncached-input prices.
+2. **Lifetime Hermes cache hit was 40 %, the last 30 days 69 %.** The difference came from moving a Gemini proxy from round-robin to sticky accounts. Provider caches are per account and per model.
+3. **Codex sessions were dominated by screenshots**: 14 M chars of base64 images against 77 k chars of text output.
+4. **Single tool results of 100 k to 600 k chars** were the main avoidable cost in Hermes and Claude Code.
+
+---
+
+## Hermes Agent extras (`hermes/`)
+
+| Script | What it does |
+|---|---|
+| `hermes/audit_prompt.py` | Breaks the rendered system prompt into sections (skills index, memory, user profile, project context). Ranks skills by *times loaded × body size* from `messages.tool_calls`, which avoids the false positive of grepping message text, where the skills index itself matches every skill. |
+| `hermes/audit_db_storage.py` | Real disk footprint (`db + wal + shm`), WAL vs the 64 MiB cap, VACUUM yield, FTS index weight. |
+| `hermes/wal_checkpoint_external.py` | Truncates an oversized WAL with the gateway stopped, then checks integrity. Only needed on old Hermes versions or with a stuck reader (see below). |
+
+Facts these scripts rely on:
+
+- Hermes puts only `name + description` of each skill in the prompt. A skill body costs tokens only when `skill_view` loads it. Deleting small unused skills saves almost nothing; trimming big skills that load often saves the most.
+- `sessions.input_tokens` is cumulative per session. Check `last_activity_at` before calling an old session expensive. Archiving idle sessions saves disk, not tokens.
+- Recent Hermes versions set `PRAGMA journal_size_limit` to 64 MiB on every connection, so `state.db-wal` stays at or below 64 MB. Running `PRAGMA journal_size_limit` from your own connection prints `-1`, because the pragma is per connection. That is not a bug.
+
+---
+
+## Pre-collect pattern (`patterns/`)
+
+An agent that searches, scrapes and deduplicates by itself makes one model call per step, and each call re-sends the growing context. A plain script can do the collection for 0 tokens and hand the model a compact JSON for a single reasoning pass. The script prints nothing when there is nothing new, so the model call can be skipped entirely.
+
+```bash
+# Hermes cron (script must live in ~/.hermes/scripts/)
+hermes cron create "every 6h" "Write a short digest of the new repos above." \
+    --script pre_collect_cron_example.py
+
+# Any CLI agent
+out=$(python patterns/pre_collect_cron_example.py)
+[ -n "$out" ] && echo "$out" | claude -p "Write a short digest of these repos."
+[ -n "$out" ] && echo "$out" | codex exec "Write a short digest of these repos."
+```
+
+How much this saves depends on how many tool steps the agent was taking. Measure your own cron sessions before and after with `agent_token_audit.py`.
+
+---
+
+## Corrections to v0.1
+
+The first release (October 2026) contained claims that did not hold up:
+
+- **"360:1 input:output bleed".** It used only uncached input and ignored the cache split entirely. With cache reads included the lifetime ratio is about 305:1. 40 % of that input (69 % in the last 30 days) was cache reads, billed at about a tenth of the price, so the cost picture was very different from the raw ratio.
+- **"-93% tokens per run" for pre-collect.** No measurement backed this number. It has been removed.
+- **"SQLite WAL reader-snapshot trap / journal_size_limit = -1 is the root cause".** Hermes already caps the WAL at 64 MiB. The `--fix-wal` flag had no lasting effect and is gone.
+- **"Largest retained tool results".** The query did not filter `role='tool'` and listed user messages.
+- **Pre-collect dedup.** It kept 500 ids sorted alphabetically, so it forgot random items instead of the oldest. It now keeps insertion order.
+- **Cron example.** It used a `--schedule` flag that does not exist; `schedule` is positional.
+
+---
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The tests use synthetic fixtures for each log format, including split Claude Code responses, duplicate Codex token events and old Hermes schemas. CI runs them on Linux, macOS and Windows.
 
 ## License
+
 MIT
